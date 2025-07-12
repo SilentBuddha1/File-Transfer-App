@@ -1,6 +1,19 @@
 use std::collections::HashMap;
-use axum::extract::ws::Message;
-use tokio::sync::{broadcast, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
+use axum::{
+    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::time::interval;
+use futures_util::{SinkExt, StreamExt};
+use uuid::Uuid;
+use serde_json::Value;
+use bytes::Bytes;
+use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 
@@ -8,9 +21,26 @@ struct AppState {
     connections: Arc<Mutex<HashMap<String, broadcast::Sender<Message>>>>,
 }
 
+#[tokio::main]
+async fn main() {
+    let state = AppState {
+        connections: Arc::new(Mutex::new(HashMap::new()))
+    };
+    let app = Router::new()
+        .route("/ws", get(websocket_handler))
+        .layer(CorsLayer::permissive())
+        .with_state(state);
 
-fn main() {
-    println!("Hello, world!");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
+    println!("Server running on ws://0.0.0.0:3001");
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState){
@@ -21,15 +51,15 @@ async fn handle_socket(socket: WebSocket, state: AppState){
     let(tx, mut rx) = broadcast::channel(100);
     {
         let mut connections = state.connections.lock().await;
-        connections.insert(conn_id_clone(), tx.clone());
+        connections.insert(conn_id_clone.clone(), tx.clone());
     }
 
     let (mut sender, mut receiver) = socket.split();
-    let (message_tx, mut message_rx) = mpsc::channel:::<Message>(100);
+    let (message_tx, mut message_rx) = mpsc::channel::<Message>(100);
 
     let sender_task = tokio::spawn(async move {
-        while let Ok(message) = message_rx.recv().await {
-            if sender.send(msg).await.is_err() {
+        while let Some(message) = message_rx.recv().await {
+            if sender.send(message).await.is_err() {
                 break;
             }
         }
@@ -40,7 +70,7 @@ async fn handle_socket(socket: WebSocket, state: AppState){
         let mut interval = interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            if ping_tx.send(Message::Ping(Vec![])).await.is_err() {
+            if ping_tx.send(Message::Ping(Bytes::new())).await.is_err() {
                 break;
             }
         }
@@ -55,42 +85,41 @@ async fn handle_socket(socket: WebSocket, state: AppState){
             }
         });
 
+        let state_for_receive = state.clone();
         let receive_task = tokio::spawn(async move {
-            let state = state.clone();
+            let state_clone = state_for_receive.clone();
             let tx = tx.clone();
             let mut target_map: HashMap<String, String> = HashMap::new();
 
-            async move {
-                while let Some(Ok(msg)) = receiver.next().await {
-                    match msg {
-                        Message::Text(text) => {
-                            if let Ok(data) = serde_json::from_str::<Value>(&text) {
-                                if data["type"] == "register" {
-                                    if let Some(id) = data["connectionId"].as_str() {
-                                        state.connections.lock().await.insert(id.to_string(), tx.clone());
-                                    }
-                                    continue;
+            while let Some(Ok(msg)) = receiver.next().await {
+                match msg {
+                    Message::Text(text) => {
+                        if let Ok(data) = serde_json::from_str::<Value>(&text) {
+                            if data["type"] == "register" {
+                                if let Some(id) = data["connectionId"].as_str() {
+                                    state_clone.connections.lock().await.insert(id.to_string(), tx.clone());
                                 }
-                                if let Some(taret_id) = data["target_id"].as_str(){
-                                    target_map.insert(conn_id.clone(), target_id.to_string());
-                                    if let Some(target_tx) =  state.connections.lock().await.get(target_id) {
-                                        let _ = target_tx.send(Message::Text(text));
-                                    }
+                                continue;
+                            }
+                            if let Some(target_id) = data["target_id"].as_str(){
+                                target_map.insert(conn_id.clone(), target_id.to_string());
+                                if let Some(target_tx) =  state_clone.connections.lock().await.get(target_id) {
+                                    let _ = target_tx.send(Message::Text(text));
                                 }
                             }
-                        }
-                        Message::Binary(bin_data) => {
-                            if let Some(taret_id) = target_map.get(&conn_id){
-                                if let Some(target_tx) =  state.connections.lock().await.get(target_id) {
-                                    let _ = target_tx.send(Message::Binary(bin_data));
-                                } else {
-                                    println!("No target set for connection: {}", conn_id);
-                                }
-                            }
-                            Message::Close(_) => break,
-                            _=> continue,
                         }
                     }
+                    Message::Binary(bin_data) => {
+                        if let Some(target_id) = target_map.get(&conn_id){
+                            if let Some(target_tx) =  state_clone.connections.lock().await.get(target_id) {
+                                let _ = target_tx.send(Message::Binary(bin_data));
+                            } else {
+                                println!("No target set for connection: {}", conn_id);
+                            }
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => continue,
                 }
             }
         });
@@ -100,7 +129,7 @@ async fn handle_socket(socket: WebSocket, state: AppState){
             _ = ping_task => {},
             _ = forward_task => {},
             _ = receive_task => {},
-        }
+        };
 
         state.connections.lock().await.remove(&conn_id_clone);
         println!("Connection {} closed", conn_id_clone);
